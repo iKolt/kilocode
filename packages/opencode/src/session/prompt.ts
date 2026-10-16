@@ -27,6 +27,8 @@ import { CommandTimeout } from "@/kilocode/command-timeout" // kilocode_change
 import { Suggestion } from "@/kilocode/suggestion" // kilocode_change
 import { Question } from "@/question" // kilocode_change
 import { BUILTIN_COMMANDS } from "@/kilocode/session/builtin-commands" // kilocode_change
+import { KiloHandoff } from "@/kilocode/session/handoff" // kilocode_change
+import { TuiEvent } from "@/server/tui-event" // kilocode_change
 import { zod } from "@opencode-ai/core/effect-zod" // kilocode_change
 import { withStatics } from "@opencode-ai/core/schema" // kilocode_change
 import { SessionID, MessageID, PartID } from "./schema"
@@ -2316,8 +2318,131 @@ export const layer = Layer.effect(
     })
     // kilocode_change end
 
+    // kilocode_change start - handoff command handler
+    const handleHandoff = Effect.fn("SessionPrompt.handleHandoff")(function* (input: CommandInput) {
+      const ctx = yield* InstanceState.context
+      const sessionID = input.sessionID
+      const fail = (message: string) =>
+        Effect.gen(function* () {
+          const error = new NamedError.Unknown({ message })
+          yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
+          return yield* Effect.fail(error)
+        })
+
+      const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+      const msgs = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
+      const lastUser = msgs.findLast((m) => m.info.role === "user")
+      if (!lastUser || lastUser.info.role !== "user" || !msgs.some((m) => m.info.role === "assistant")) {
+        return yield* fail("Nothing to hand off yet — run a few steps first.")
+      }
+
+      const agentName = input.agent ?? lastUser.info.agent
+      const agent = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
+      if (!agent) {
+        const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
+        const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
+        return yield* fail(`Agent not found: "${agentName}".${hint}`)
+      }
+      const model = input.model ? Provider.parseModel(input.model) : (lastUser.info.model ?? (yield* currentModel(sessionID)))
+      const mdl = yield* getModel(model.providerID, model.modelID, sessionID)
+
+      // Generate the handoff document + kickoff prompt in one call.
+      const history = yield* MessageV2.toModelMessagesEffect(msgs, mdl, {
+        stripMedia: true,
+        toolOutputMaxChars: 2_000,
+      }).pipe(Effect.provideService(Database.Service, database))
+      const extra = input.arguments.trim()
+      const requestUser: SessionV1.User = {
+        id: MessageID.ascending(),
+        sessionID,
+        role: "user",
+        time: { created: Date.now() },
+        agent: agent.name,
+        model: { providerID: mdl.providerID, modelID: mdl.id },
+      }
+      const text = yield* llm
+        .stream({
+          agent,
+          user: requestUser,
+          system: [],
+          tools: {},
+          model: mdl,
+          sessionID: `handoff-${sessionID}`,
+          retries: 1,
+          messages: [
+            ...history,
+            {
+              role: "user" as const,
+              content: extra
+                ? `${KiloHandoff.PROMPT}\n\nAdditional context from the user:\n${extra}`
+                : KiloHandoff.PROMPT,
+            },
+          ],
+        })
+        .pipe(
+          Stream.filter(LLMEvent.is.textDelta),
+          Stream.map((e) => e.text),
+          Stream.mkString,
+          Effect.catch(() => fail("Handoff generation failed. Check your model connection and try again.")),
+        )
+
+      const parsed = KiloHandoff.parse(text)
+      if (!parsed) return yield* fail("The model did not produce a handoff in the expected format. Try again.")
+
+      // Persist the handoff document under .kilo/handoff/.
+      const file = KiloHandoff.file(ctx.directory, sessionID, Date.now())
+      yield* Effect.tryPromise({
+        try: async () => {
+          await fs.promises.mkdir(path.dirname(file), { recursive: true })
+          await fs.promises.writeFile(file, parsed.document, "utf8")
+        },
+        catch: () => new NamedError.Unknown({ message: `Failed to write the handoff file: ${file}` }),
+      }).pipe(Effect.catch((error) => fail(error.message)))
+
+      // Create the target session and inject the kickoff message.
+      const next = yield* sessions.create({
+        agent: agent.name,
+        model: { id: mdl.id, providerID: mdl.providerID },
+        title: `Handoff: ${session.title}`,
+      })
+      const userMsg: SessionV1.User = {
+        id: MessageID.ascending(),
+        sessionID: next.id,
+        role: "user",
+        time: { created: Date.now() },
+        agent: agent.name,
+        model: { providerID: mdl.providerID, modelID: mdl.id },
+      }
+      yield* sessions.updateMessage(userMsg)
+      const part: SessionV1.TextPart = {
+        id: PartID.ascending(),
+        messageID: userMsg.id,
+        sessionID: next.id,
+        type: "text",
+        text: KiloHandoff.kickoff({ file, document: parsed.document, prompt: parsed.prompt }),
+        synthetic: false,
+      }
+      yield* sessions.updatePart(part)
+
+      // Switch the client to the new session, then start it in the background so
+      // this command returns promptly instead of blocking on the first turn.
+      yield* events.publish(TuiEvent.SessionSelect, { sessionID: next.id })
+      const bridge = yield* EffectBridge.make()
+      bridge.fork(loop({ sessionID: next.id }).pipe(Effect.orDie))
+
+      yield* events.publish(Command.Event.Executed, {
+        name: input.command,
+        sessionID,
+        arguments: input.arguments,
+        messageID: userMsg.id,
+      })
+      return { info: userMsg, parts: [part] }
+    })
+    // kilocode_change end
+
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
       if (input.command === "goal") return yield* goals.command(input) // kilocode_change
+      if (input.command === "handoff") return yield* handleHandoff(input) // kilocode_change
       const ticket = yield* control.begin(input.sessionID, false) // kilocode_change
       yield* Effect.logInfo("command", {
         "session.id": input.sessionID,

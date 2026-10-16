@@ -337,6 +337,91 @@ function liveRuntime(layer: Layer.Layer<LLM.Service>, context = 10_000) {
   )
 }
 
+// Content-aware chunk processor: fails the chunks in `fail`, records every
+// chunk number actually sent to the model in `processed`, and answers the
+// reduce step with "final summary". Used to verify the chunk-summary cache.
+function chunkRuntime(opts: { fail: (chunk: number) => boolean; processed: number[] }) {
+  const processor = Layer.effect(
+    SessionProcessorModule.SessionProcessor.Service,
+    Effect.gen(function* () {
+      const sessions = yield* SessionNs.Service
+      return SessionProcessorModule.SessionProcessor.Service.of({
+        create: Effect.fn("TestChunkProcessor.create")((input) =>
+          Effect.succeed({
+            get message() {
+              return input.assistantMessage
+            },
+            updateToolCall: Effect.fn("TestChunkProcessor.updateToolCall")(() => Effect.succeed(undefined)),
+            metadata: Effect.fn("TestChunkProcessor.metadata")(() => Effect.void),
+            completeToolCall: Effect.fn("TestChunkProcessor.completeToolCall")(() => Effect.void),
+            process: Effect.fn("TestChunkProcessor.process")((stream: LLM.StreamInput) =>
+              Effect.gen(function* () {
+                const body = JSON.stringify(stream.messages)
+                const match = body.match(/Summarize conversation chunk (\d+) of (\d+)/)
+                if (match) {
+                  const chunk = Number(match[1])
+                  opts.processed.push(chunk) // record every chunk sent to the model
+                  if (opts.fail(chunk)) {
+                    input.assistantMessage.error = new MessageV2.APIError({
+                      message: `chunk ${chunk} failed`,
+                      isRetryable: true,
+                    }).toObject()
+                    input.assistantMessage.finish = "error"
+                    yield* sessions.updateMessage(input.assistantMessage)
+                    return "stop" as const
+                  }
+                  yield* sessions.updatePart({
+                    id: PartID.ascending(),
+                    messageID: input.assistantMessage.id,
+                    sessionID: input.sessionID,
+                    type: "text",
+                    text: `summary ${chunk}`,
+                  })
+                  input.assistantMessage.finish = "stop"
+                  return "continue" as const
+                }
+                yield* sessions.updatePart({
+                  id: PartID.ascending(),
+                  messageID: input.assistantMessage.id,
+                  sessionID: input.sessionID,
+                  type: "text",
+                  text: "final summary",
+                })
+                input.assistantMessage.finish = "stop"
+                return "continue" as const
+              }),
+            ),
+          } satisfies SessionProcessor.Handle),
+        ),
+      })
+    }),
+  )
+  const processorNode = LayerNode.make({
+    service: SessionProcessorModule.SessionProcessor.Service,
+    layer: processor,
+    deps: [SessionNs.node],
+  })
+  const model = ProviderTest.model({ providerID, id: modelID, limit: { context: 10_000, output: 1_000 } })
+  return ManagedRuntime.make(
+    LayerNode.compile(
+      LayerNode.group([SessionCompaction.node, SessionNs.node, SessionProjector.node, Bus.node, EventV2Bridge.node]),
+      [
+        [SessionProcessorModule.SessionProcessor.node, processorNode],
+        [Provider.node, ProviderTest.fake({ model }).layer],
+        [Agent.node, agents],
+        [RuntimeFlags.node, RuntimeFlags.layer()],
+        [
+          Config.node,
+          Layer.mock(Config.Service)({
+            get: () => Effect.succeed({ ...{}, compaction: { reserved: 1_000 } }),
+            directories: () => Effect.succeed([]),
+          }),
+        ],
+      ],
+    ),
+  )
+}
+
 afterEach(() => {
   mock.restore()
 })
@@ -493,6 +578,68 @@ describe("KiloCompactionChunks", () => {
         } finally {
           await rt.dispose()
         }
+      },
+    })
+  })
+
+  test("resumes a failed chunked compaction from the failed chunk", async () => {
+    await using tmp = await tmpdir()
+    await provideTestInstance({
+      directory: tmp.path,
+      fn: async () => {
+        const session = await svc.create({})
+        // enough oversized messages to split into several chunks
+        for (let index = 0; index < 3; index++) {
+          const turn = await user(session.id, `turn ${index} ` + "x".repeat(10_000))
+          await assistant(session.id, turn.id, tmp.path, `reply ${index} ` + "y".repeat(10_000))
+        }
+        await Effect.runPromise(
+          KiloSessionCompaction.create({
+            session: store,
+            sessionID: session.id,
+            agent: "build",
+            model: ref,
+            auto: false,
+          }),
+        )
+
+        // capture the exact head once so both attempts chunk identical content
+        const msgs = await svc.messages({ sessionID: session.id })
+        const parent = msgs.at(-1)?.info.id
+        expect(parent).toBeTruthy()
+
+        // attempt 1: chunk 2 fails; every chunk is attempted, the rest are cached
+        const processed1: number[] = []
+        const rt1 = chunkRuntime({ fail: (chunk) => chunk === 2, processed: processed1 })
+        try {
+          const result = await rt1.runPromise(
+            SessionCompaction.Service.use((svc) =>
+              svc.process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false }),
+            ),
+          )
+          expect(result).toBe("stop")
+        } finally {
+          await rt1.dispose()
+        }
+        expect(processed1.length).toBeGreaterThanOrEqual(3)
+        expect(processed1).toContain(2)
+
+        // attempt 2 (retry): nothing fails; only the previously failed chunk is recomputed
+        const processed2: number[] = []
+        const rt2 = chunkRuntime({ fail: () => false, processed: processed2 })
+        try {
+          const result = await rt2.runPromise(
+            SessionCompaction.Service.use((svc) =>
+              svc.process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false }),
+            ),
+          )
+          expect(result).toBe("continue")
+        } finally {
+          await rt2.dispose()
+        }
+        // chunks that succeeded in attempt 1 are served from the cache, so the
+        // model is only called for the chunk that failed (plus the reduce step)
+        expect(processed2).toEqual([2])
       },
     })
   })

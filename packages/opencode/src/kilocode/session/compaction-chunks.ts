@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { Effect } from "effect"
 import type { Agent } from "@/agent/agent"
 import type { Config } from "@/config/config"
@@ -37,6 +38,42 @@ export namespace KiloCompactionChunks {
     result: SessionProcessor.Result
     output: string | undefined
     error: MessageV2.Assistant["error"]
+  }
+
+  // Completed chunk summaries, keyed by content fingerprint. A retry after a
+  // partial failure re-enters process() and re-splits the same head into the
+  // same chunks, so fingerprinting lets it skip chunks already summarized
+  // instead of restarting from chunk 0. In-memory is enough: a retry runs in
+  // the same backend process, and because the key fingerprints content (plus
+  // model and chunk count), entries from other sessions or a changed head
+  // never match. Insertion-ordered so the oldest entry evicts first.
+  const CACHE_MAX = 256
+  const cache = new Map<string, string>()
+
+  function fingerprint(input: { model: Provider.Model; total: number; chunk: Chunk }) {
+    const hash = createHash("sha1")
+    hash.update(input.model.id)
+    hash.update("\0")
+    hash.update(String(input.total))
+    hash.update("\0")
+    hash.update(JSON.stringify(input.chunk.messages))
+    return hash.digest("hex")
+  }
+
+  function cached(key: string) {
+    const hit = cache.get(key)
+    if (hit === undefined) return undefined
+    cache.delete(key)
+    cache.set(key, hit) // refresh recency
+    return hit
+  }
+
+  function store(key: string, summary: string) {
+    cache.delete(key)
+    cache.set(key, summary)
+    if (cache.size <= CACHE_MAX) return
+    const oldest = cache.keys().next()
+    if (!oldest.done) cache.delete(oldest.value)
   }
 
   type Deps = {
@@ -339,6 +376,23 @@ export namespace KiloCompactionChunks {
     })
   }
 
+  // Summarize one chunk, reusing the cached summary when this exact chunk was
+  // already summarized in an earlier (failed) attempt. Only successful results
+  // are cached, so a failed chunk is always recomputed on retry.
+  function resume(input: Input & { chunk: Chunk; total: number }) {
+    return Effect.gen(function* () {
+      const key = fingerprint(input)
+      const hit = cached(key)
+      if (hit !== undefined) {
+        log.info("chunk cache hit", { index: input.chunk.index, total: input.total })
+        return { result: "continue" as const, output: hit, error: undefined } satisfies Output
+      }
+      const out = yield* summarize(input)
+      if (out.result === "continue" && out.output) store(key, out.output)
+      return out
+    })
+  }
+
   function reduce(
     input: Input & { summaries: string[]; depth: number },
   ): Effect.Effect<Output, never, Database.Service> {
@@ -368,7 +422,7 @@ export namespace KiloCompactionChunks {
       const chunks = yield* split({ messages: input.messages, model: input.model, size })
       log.info("fallback", { chunks: chunks.length, concurrency: CONCURRENCY })
 
-      const partial = yield* Effect.forEach(chunks, (chunk) => summarize({ ...input, chunk, total: chunks.length }), {
+      const partial = yield* Effect.forEach(chunks, (chunk) => resume({ ...input, chunk, total: chunks.length }), {
         concurrency: Math.min(CONCURRENCY, chunks.length),
       })
       const failed = partial.find(fatal) ?? partial.find((item) => item.result !== "continue" || !item.output)

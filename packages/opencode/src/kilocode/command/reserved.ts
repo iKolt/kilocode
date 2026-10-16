@@ -9,7 +9,8 @@
 // may legitimately use those names. MCP prompts cannot clash either: McpCatalog keys
 // them as `<client>:<prompt>`, which never equals a bare command name.
 export function reserved(name: string) {
-  return name === "goal"
+  // `handoff` is intercepted before registry lookup just like `goal`.
+  return name === "goal" || name === "handoff"
 }
 
 export function alias(name: string) {

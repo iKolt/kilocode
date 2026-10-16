@@ -126,6 +126,14 @@ const layer = Layer.effect(
       }
       commands["resume-claude"] = SessionResume.resumeClaude
       commands["resume-codex"] = SessionResume.resumeCodex
+      commands.handoff = {
+        name: "handoff",
+        description:
+          "Hand off to a fresh session: the model writes a handoff document and a kickoff prompt, saves the document under .kilo/handoff/, and starts a new session on them.",
+        source: "command",
+        template: "$ARGUMENTS",
+        hints: ["[extra context for the handoff]"],
+      }
       // kilocode_change end
 
       // kilocode_change start - defer partial overrides until all command sources are registered

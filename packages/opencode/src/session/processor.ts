@@ -15,7 +15,7 @@ import { LLM } from "./llm"
 import { MessageV2 } from "./message-v2"
 import { isOverflow } from "./overflow"
 import { RuntimeFlags } from "@/effect/runtime-flags" // kilocode_change - configured output token ceiling
-import { PartID } from "./schema"
+import { MessageID, PartID } from "./schema" // kilocode_change - MessageID for loop-guard followup
 import type { SessionID } from "./schema"
 import { SessionRetry } from "./retry"
 import { SessionStatus } from "./status"
@@ -30,6 +30,8 @@ import { KiloSessionOverflow } from "@/kilocode/session/overflow"
 import { KiloRoutedModel } from "@/kilocode/session/routed-model"
 import { KiloResponseMetadata } from "@/kilocode/session/response-metadata"
 import { Suggestion } from "@/kilocode/suggestion"
+import { KiloLoopGuard } from "@/kilocode/session/loop-guard"
+import { KiloSessionPromptQueue } from "@/kilocode/session/prompt-queue"
 // kilocode_change end
 import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
@@ -101,6 +103,7 @@ interface ProcessorContext extends Input {
   stepStart: number
   stepStartDate: number | undefined
   step: { reasoning: boolean; text: boolean; tool: boolean }
+  loop: KiloLoopGuard.State
   // kilocode_change end
 }
 
@@ -155,6 +158,7 @@ const layer = Layer.effect(
         stepStart: 0,
         stepStartDate: undefined,
         step: { reasoning: false, text: false, tool: false },
+        loop: KiloLoopGuard.state(),
         // kilocode_change end
       }
       let aborted = false
@@ -425,6 +429,14 @@ const layer = Layer.effect(
             ctx.reasoningMap[value.id].text += value.text
             if (value.text.trim()) ctx.step.reasoning = true // kilocode_change
             if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
+            // kilocode_change start - trip the loop guard on a repeated reasoning block
+            if (KiloLoopGuard.inspect(ctx.loop, value.id, ctx.reasoningMap[value.id].text)) {
+              yield* Effect.logWarning("reasoning loop detected", {
+                "session.id": ctx.sessionID,
+                messageID: ctx.assistantMessage.id,
+              })
+            }
+            // kilocode_change end
             yield* session.updatePartDelta({
               sessionID: ctx.reasoningMap[value.id].sessionID,
               messageID: ctx.reasoningMap[value.id].messageID,
@@ -779,7 +791,10 @@ const layer = Layer.effect(
           case "text-delta":
             if (!ctx.currentText) return
             ctx.currentText.text += value.text
-            if (value.text.trim()) ctx.step.text = true // kilocode_change
+            if (value.text.trim()) {
+              ctx.step.text = true
+              KiloLoopGuard.noteText(ctx.sessionID) // real answer text means the model recovered
+            } // kilocode_change
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
             yield* session.updatePartDelta({
               sessionID: ctx.currentText.sessionID,
@@ -997,7 +1012,7 @@ const layer = Layer.effect(
                   stream.pipe(
                     Stream.tap((event) => handleEvent(event)),
                     Stream.tap(() => Effect.sync(() => guard.touch())),
-                    Stream.takeUntil(() => ctx.needsCompaction),
+                    Stream.takeUntil(() => ctx.needsCompaction || ctx.loop.detected), // kilocode_change - stop on reasoning loop
                     Stream.runDrain,
                   ),
                 ),
@@ -1071,6 +1086,8 @@ const layer = Layer.effect(
                 yield* request()
               }),
               replayable: () =>
+                // kilocode_change - a loop interruption is deliberate, not an incomplete response to retry
+                !ctx.loop.detected &&
                 KiloSessionProcessor.replayable({
                   finish: attempt.finish,
                   text: attempt.text,
@@ -1084,6 +1101,45 @@ const layer = Layer.effect(
           }
 
           yield* recover().pipe(Effect.catch(halt), Effect.ensuring(cleanup()))
+          // kilocode_change end
+
+          // kilocode_change start - a reasoning loop interrupted the stream: tell the model and let it answer
+          if (ctx.loop.detected) {
+            const count = KiloLoopGuard.noteInterrupt(ctx.sessionID)
+            if (count > KiloLoopGuard.MAX_INTERRUPTS) {
+              const error = new MessageV2.APIError({
+                message: `Stopped after ${KiloLoopGuard.MAX_INTERRUPTS} reasoning loops: the model kept repeating itself and did not recover.`,
+                isRetryable: false,
+              }).toObject()
+              ctx.assistantMessage.error = error
+              yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
+              yield* status.set(ctx.sessionID, { type: "idle" })
+              return "stop"
+            }
+            const followup = yield* session.updateMessage({
+              id: MessageID.ascending(),
+              role: "user",
+              sessionID: ctx.sessionID,
+              time: { created: Date.now() },
+              agent: ctx.assistantMessage.agent,
+              model: { providerID: ctx.assistantMessage.providerID, modelID: ctx.assistantMessage.modelID },
+            })
+            KiloSessionPromptQueue.retarget(ctx.sessionID, followup.id)
+            yield* session.updatePart({
+              id: PartID.ascending(),
+              messageID: followup.id,
+              sessionID: ctx.sessionID,
+              type: "text",
+              synthetic: true,
+              metadata: { reasoning_loop: true },
+              text:
+                "Your previous reasoning got stuck repeating the same text over and over without reaching an " +
+                "answer, so it was cut off. Do not repeat that reasoning. In one or two sentences, note where " +
+                "you were, then continue straight to the actual answer or the next concrete step.",
+              time: { start: Date.now(), end: Date.now() },
+            })
+            return "continue"
+          }
           // kilocode_change end
 
           if (ctx.needsCompaction) return "compact"

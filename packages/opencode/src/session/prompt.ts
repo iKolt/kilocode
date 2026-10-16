@@ -2425,10 +2425,11 @@ export const layer = Layer.effect(
       yield* sessions.updatePart(part)
 
       // Switch the client to the new session, then start it in the background so
-      // this command returns promptly instead of blocking on the first turn.
+      // this command returns promptly instead of blocking on the first turn. The
+      // loop is forked into the service scope so it inherits the instance context
+      // and is torn down with the service rather than leaking as a root daemon.
       yield* events.publish(TuiEvent.SessionSelect, { sessionID: next.id })
-      const bridge = yield* EffectBridge.make()
-      bridge.fork(loop({ sessionID: next.id }).pipe(Effect.orDie))
+      yield* loop({ sessionID: next.id }).pipe(Effect.orDie, Effect.forkIn(scope))
 
       yield* events.publish(Command.Event.Executed, {
         name: input.command,

@@ -5453,6 +5453,14 @@ export class KiloProvider implements vscode.WebviewViewProvider, TelemetryProper
       return
     }
 
+    // The backend publishes tui.session.select when a command asks the client to
+    // open a different session (e.g. the /handoff command creating a fresh one).
+    if (event.type === "tui.session.select") {
+      const sessionID = (event.properties as { sessionID?: string } | undefined)?.sessionID
+      if (sessionID) void this.openSession(sessionID)
+      return
+    }
+
     if (event.type === "memory.status" || event.type === "memory.updated" || event.type === "memory.error") {
       const props = event.properties as { sessionID?: unknown; detail?: unknown; reason?: unknown }
       const eventSessionID = typeof props.sessionID === "string" ? props.sessionID : undefined

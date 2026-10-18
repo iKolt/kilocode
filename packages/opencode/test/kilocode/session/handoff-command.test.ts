@@ -133,16 +133,22 @@ it.instance("creates a new session with the kickoff and writes the handoff file"
       arguments: "",
     })
 
-    // The command returns the kickoff user message, living in a NEW session.
-    expect(result.info.role).toBe("user")
-    expect(result.info.sessionID).not.toBe(session.id)
+    // The command returns a visible confirmation in the ORIGINAL session.
+    expect(result.info.role).toBe("assistant")
+    expect(result.info.sessionID).toBe(session.id)
     const text = result.parts.find((p): p is MessageV2.TextPart => p.type === "text")
-    expect(text?.text).toContain("Continue building.")
-    expect(text?.text).toContain("## Goal")
+    expect(text?.text).toContain("Handoff ready")
 
-    // The new session holds the kickoff message.
-    const nextMsgs = yield* sessions.messages({ sessionID: result.info.sessionID })
-    expect(nextMsgs.some((m) => m.info.id === result.info.id)).toBe(true)
+    // A new session was created holding the kickoff message.
+    const all = yield* sessions.list().pipe(Effect.orDie)
+    const next = all.find((s) => s.id !== session.id && !s.parentID)
+    expect(next).toBeDefined()
+    const nextMsgs = yield* sessions.messages({ sessionID: next!.id })
+    const kickoff = nextMsgs
+      .flatMap((m) => m.parts)
+      .find((p): p is MessageV2.TextPart => p.type === "text" && p.text.includes("Continue building."))
+    expect(kickoff).toBeDefined()
+    expect(kickoff!.text).toContain("## Goal")
 
     // The handoff document was persisted under .kilo/handoff/.
     const dir = path.join(instance.directory, ".kilo", "handoff")

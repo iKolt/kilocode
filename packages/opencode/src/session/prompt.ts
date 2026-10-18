@@ -2424,20 +2424,52 @@ export const layer = Layer.effect(
       }
       yield* sessions.updatePart(part)
 
-      // Switch the client to the new session, then start it in the background so
-      // this command returns promptly instead of blocking on the first turn. The
-      // loop is forked into the service scope so it inherits the instance context
-      // and is torn down with the service rather than leaking as a root daemon.
+      // Switch the client to the new session (TUI), then start it in the
+      // background so this command returns promptly instead of blocking on the
+      // first turn. The loop is forked into the service scope so it inherits the
+      // instance context and is torn down with the service rather than leaking.
       yield* events.publish(TuiEvent.SessionSelect, { sessionID: next.id })
       yield* loop({ sessionID: next.id }).pipe(Effect.orDie, Effect.forkIn(scope))
+
+      // Leave a visible confirmation in the session the command ran in. The VS
+      // Code extension does not act on TuiEvent.SessionSelect, so without this
+      // the handoff looks like it did nothing; the message tells the user it
+      // succeeded and where the new session is.
+      const confirm: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        sessionID,
+        role: "assistant",
+        parentID: lastUser.info.id,
+        mode: agent.name,
+        agent: agent.name,
+        path: { cwd: ctx.directory, root: ctx.directory },
+        cost: 0,
+        tokens: { output: 0, input: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: mdl.id,
+        providerID: mdl.providerID,
+        time: { created: Date.now(), completed: Date.now() },
+        finish: "stop",
+      }
+      yield* sessions.updateMessage(confirm)
+      const confirmPart: SessionV1.TextPart = {
+        id: PartID.ascending(),
+        messageID: confirm.id,
+        sessionID,
+        type: "text",
+        synthetic: true,
+        text:
+          `Handoff ready → new session "${next.title}" (${next.id}).\n\n` +
+          `Handoff document saved to \`${file}\`. Open the new session to continue there.`,
+      }
+      yield* sessions.updatePart(confirmPart)
 
       yield* events.publish(Command.Event.Executed, {
         name: input.command,
         sessionID,
         arguments: input.arguments,
-        messageID: userMsg.id,
+        messageID: confirm.id,
       })
-      return { info: userMsg, parts: [part] }
+      return { info: confirm, parts: [confirmPart] }
     })
     // kilocode_change end
 

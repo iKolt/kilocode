@@ -43,14 +43,20 @@ describe("kilocode.session.handoff.parse", () => {
   })
 })
 
-describe("kilocode.session.handoff.kickoff", () => {
-  test("includes the prompt, the file path, and the document", () => {
-    const text = KiloHandoff.kickoff({ file: "/proj/.kilo/handoff/x.md", document: "THE DOC", prompt: "THE PROMPT" })
+describe("kilocode.session.handoff.prompt", () => {
+  test("carries the kickoff prompt and points at the file", () => {
+    const text = KiloHandoff.prompt({ file: ".kilo/handoff/x.md", prompt: "THE PROMPT" })
     expect(text).toContain("THE PROMPT")
-    expect(text).toContain("/proj/.kilo/handoff/x.md")
-    expect(text).toContain("THE DOC")
-    // prompt leads, document trails
-    expect(text.indexOf("THE PROMPT")).toBeLessThan(text.indexOf("THE DOC"))
+    expect(text).toContain(".kilo/handoff/x.md")
+  })
+})
+
+describe("kilocode.session.handoff.response", () => {
+  test("includes the saved path and the copyable prompt block", () => {
+    const text = KiloHandoff.response({ file: ".kilo/handoff/x.md", prompt: "THE PROMPT" })
+    expect(text).toContain("Handoff ready")
+    expect(text).toContain(".kilo/handoff/x.md")
+    expect(text).toContain("THE PROMPT")
   })
 })
 

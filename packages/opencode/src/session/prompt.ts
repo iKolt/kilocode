@@ -28,7 +28,6 @@ import { Suggestion } from "@/kilocode/suggestion" // kilocode_change
 import { Question } from "@/question" // kilocode_change
 import { BUILTIN_COMMANDS } from "@/kilocode/session/builtin-commands" // kilocode_change
 import { KiloHandoff } from "@/kilocode/session/handoff" // kilocode_change
-import { TuiEvent } from "@/server/tui-event" // kilocode_change
 import { zod } from "@opencode-ai/core/effect-zod" // kilocode_change
 import { withStatics } from "@opencode-ai/core/schema" // kilocode_change
 import { SessionID, MessageID, PartID } from "./schema"
@@ -2329,7 +2328,6 @@ export const layer = Layer.effect(
           return yield* Effect.fail(error)
         })
 
-      const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
       const msgs = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
       const lastUser = msgs.findLast((m) => m.info.role === "user")
       if (!lastUser || lastUser.info.role !== "user" || !msgs.some((m) => m.info.role === "assistant")) {
@@ -2399,43 +2397,10 @@ export const layer = Layer.effect(
         catch: () => new NamedError.Unknown({ message: `Failed to write the handoff file: ${file}` }),
       }).pipe(Effect.catch((error) => fail(error.message)))
 
-      // Create the target session and inject the kickoff message.
-      const next = yield* sessions.create({
-        agent: agent.name,
-        model: { id: mdl.id, providerID: mdl.providerID },
-        title: `Handoff: ${session.title}`,
-      })
-      const userMsg: SessionV1.User = {
-        id: MessageID.ascending(),
-        sessionID: next.id,
-        role: "user",
-        time: { created: Date.now() },
-        agent: agent.name,
-        model: { providerID: mdl.providerID, modelID: mdl.id },
-      }
-      yield* sessions.updateMessage(userMsg)
-      const part: SessionV1.TextPart = {
-        id: PartID.ascending(),
-        messageID: userMsg.id,
-        sessionID: next.id,
-        type: "text",
-        text: KiloHandoff.kickoff({ file, document: parsed.document, prompt: parsed.prompt }),
-        synthetic: false,
-      }
-      yield* sessions.updatePart(part)
-
-      // Switch the client to the new session (TUI), then start it in the
-      // background so this command returns promptly instead of blocking on the
-      // first turn. The loop is forked into the service scope so it inherits the
-      // instance context and is torn down with the service rather than leaking.
-      yield* events.publish(TuiEvent.SessionSelect, { sessionID: next.id })
-      yield* loop({ sessionID: next.id }).pipe(Effect.orDie, Effect.forkIn(scope))
-
-      // Leave a visible confirmation in the session the command ran in. The VS
-      // Code extension does not act on TuiEvent.SessionSelect, so without this
-      // the handoff looks like it did nothing; the message tells the user it
-      // succeeded and where the new session is.
-      const confirm: SessionV1.Assistant = {
+      // Leave the copyable prompt in the session the command ran in. No session
+      // is created: the user opens a new one and pastes the prompt themselves.
+      const rel = path.relative(ctx.directory, file).split(path.sep).join("/")
+      const answer: SessionV1.Assistant = {
         id: MessageID.ascending(),
         sessionID,
         role: "assistant",
@@ -2450,26 +2415,24 @@ export const layer = Layer.effect(
         time: { created: Date.now(), completed: Date.now() },
         finish: "stop",
       }
-      yield* sessions.updateMessage(confirm)
-      const confirmPart: SessionV1.TextPart = {
+      yield* sessions.updateMessage(answer)
+      const answerPart: SessionV1.TextPart = {
         id: PartID.ascending(),
-        messageID: confirm.id,
+        messageID: answer.id,
         sessionID,
         type: "text",
         synthetic: true,
-        text:
-          `Handoff ready → new session "${next.title}" (${next.id}).\n\n` +
-          `Handoff document saved to \`${file}\`. Open the new session to continue there.`,
+        text: KiloHandoff.response({ file: rel, prompt: parsed.prompt }),
       }
-      yield* sessions.updatePart(confirmPart)
+      yield* sessions.updatePart(answerPart)
 
       yield* events.publish(Command.Event.Executed, {
         name: input.command,
         sessionID,
         arguments: input.arguments,
-        messageID: confirm.id,
+        messageID: answer.id,
       })
-      return { info: confirm, parts: [confirmPart] }
+      return { info: answer, parts: [answerPart] }
     })
     // kilocode_change end
 

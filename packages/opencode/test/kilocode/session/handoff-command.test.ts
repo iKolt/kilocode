@@ -119,13 +119,12 @@ it.instance("creates a new session with the kickoff and writes the handoff file"
     const session = yield* sessions.create({ title: "Origin session" })
     yield* seed(session.id)
 
-    // First request is the handoff generation; the forked new-session loop is the second.
+    // One request: the handoff generation. No session is created.
     yield* llm.push(
       reply()
         .text("---DOCUMENT---\n## Goal\nBuild the thing.\n\n## Progress\nStarted.\n---PROMPT---\nContinue building.")
         .stop(),
     )
-    yield* llm.push(reply().text("new session answer").stop())
 
     const result = yield* prompt.command({
       sessionID: session.id,
@@ -133,22 +132,16 @@ it.instance("creates a new session with the kickoff and writes the handoff file"
       arguments: "",
     })
 
-    // The command returns a visible confirmation in the ORIGINAL session.
+    // The command leaves a response in the ORIGINAL session with the prompt.
     expect(result.info.role).toBe("assistant")
     expect(result.info.sessionID).toBe(session.id)
     const text = result.parts.find((p): p is MessageV2.TextPart => p.type === "text")
     expect(text?.text).toContain("Handoff ready")
+    expect(text?.text).toContain("Continue building.")
 
-    // A new session was created holding the kickoff message.
+    // No new session was created.
     const all = yield* sessions.list().pipe(Effect.orDie)
-    const next = all.find((s) => s.id !== session.id && !s.parentID)
-    expect(next).toBeDefined()
-    const nextMsgs = yield* sessions.messages({ sessionID: next!.id })
-    const kickoff = nextMsgs
-      .flatMap((m) => m.parts)
-      .find((p): p is MessageV2.TextPart => p.type === "text" && p.text.includes("Continue building."))
-    expect(kickoff).toBeDefined()
-    expect(kickoff!.text).toContain("## Goal")
+    expect(all.filter((s) => s.id !== session.id && !s.parentID)).toHaveLength(0)
 
     // The handoff document was persisted under .kilo/handoff/.
     const dir = path.join(instance.directory, ".kilo", "handoff")

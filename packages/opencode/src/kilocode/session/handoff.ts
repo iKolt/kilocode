@@ -3,11 +3,11 @@ import path from "path"
 import type { SessionID } from "@/session/schema"
 
 /**
- * Building blocks for the /handoff command: capture the current session into a
- * durable handoff document plus a kickoff prompt, then start a fresh session on
- * them. The pure pieces (prompt template, output parsing, kickoff text, file
- * path) live here so they stay unit-testable; the orchestration that touches
- * session/LLM services lives in SessionPrompt.handleHandoff.
+ * Building blocks for the /handoff command: turn the current session into a
+ * durable handoff document plus a kickoff prompt the user can paste into a
+ * fresh session. The pure pieces (prompt template, output parsing, response
+ * text, file path) live here so they stay unit-testable; the orchestration that
+ * touches session/LLM services lives in SessionPrompt.handleHandoff.
  */
 export namespace KiloHandoff {
   /** Handoff files live under `<project>/.kilo/handoff/`. */
@@ -62,20 +62,28 @@ ${PROMPT_TAG}
   }
 
   /**
-   * The first user message injected into the new session: the kickoff prompt
-   * followed by the full handoff document inline, so the fresh session has the
-   * context immediately without a file read. The file path is noted as the
-   * durable record.
+   * The self-contained prompt the user pastes into a new session. It carries the
+   * model's kickoff text plus a pointer to the saved handoff document, so the
+   * fresh session restores full context before continuing.
    */
-  export function kickoff(input: { file: string; document: string; prompt: string }): string {
+  export function prompt(input: { file: string; prompt: string }): string {
+    return `${input.prompt}\n\nFull handoff document: \`${input.file}\` (read it first to restore context).`
+  }
+
+  /**
+   * The assistant response left in the origin session: tells the user the
+   * handoff is ready, where the document was saved, and gives the prompt in a
+   * fenced block they can copy into a new session.
+   */
+  export function response(input: { file: string; prompt: string }): string {
     return [
-      input.prompt,
+      `Handoff ready. Document saved to \`${input.file}\`.`,
       "",
-      "## Handoff document",
+      "Copy this whole block into a new session:",
       "",
-      `Saved to \`${input.file}\`. Full contents:`,
-      "",
-      input.document,
+      "```",
+      prompt(input),
+      "```",
     ].join("\n")
   }
 
